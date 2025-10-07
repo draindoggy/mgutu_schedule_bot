@@ -1,4 +1,5 @@
 aiogram==3.3.0
 aiohttp==3.9.5
 python-dotenv==1.0.0
+fastapi==0.111.1
 Werkzeug==2.3.4
