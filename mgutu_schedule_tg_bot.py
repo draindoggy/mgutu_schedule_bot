@@ -1,15 +1,15 @@
 import asyncio
+import json
+import os
 from datetime import datetime, timedelta
+import aiohttp
 from aiogram import Bot, Dispatcher
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-import aiohttp
-import os
 from dotenv import load_dotenv
-
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -18,19 +18,63 @@ SCHEDULE_URL = 'https://dec.mgutm.ru/api/Rasp?idGroup=30948'
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+CACHE_FILE = "schedule_cache.json"
+CACHE_DAYS = 7
+
 class ScheduleStates(StatesGroup):
     select_subgroup = State()
     select_date = State()
 
-async def get_schedule(date: datetime.date, subgroup: str) -> str:
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache):
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+def clean_cache(cache):
+    cutoff_date = datetime.now().date() - timedelta(days=CACHE_DAYS)
+    keys_to_delete = []
+    for key in cache.keys():
+        date_str = key.split("_")[0]  # ключ формата "YYYY-MM-DD_subgroup"
+        try:
+            key_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if key_date < cutoff_date:
+                keys_to_delete.append(key)
+        except Exception:
+            keys_to_delete.append(key)
+    for key in keys_to_delete:
+        del cache[key]
+    return cache
+
+async def fetch_schedule_from_api():
     async with aiohttp.ClientSession() as session:
         async with session.get(SCHEDULE_URL) as response:
             if response.status != 200:
-                return f"ошибка при загрузке расписания: статус {response.status}"
-            data = await response.json()
+                return None
+            return await response.json()
 
-    if not data.get('data', {}).get('rasp'):
-        return f"расписание для {date.strftime('%d.%m.%Y')} не найдено."
+async def get_schedule(date: datetime.date, subgroup: str) -> str:
+    cache = load_cache()
+    cache = clean_cache(cache)
+    key = f"{date}_{subgroup}"
+
+    if key in cache:
+        save_cache(cache)
+        return cache[key]
+
+    data = await fetch_schedule_from_api()
+    if not data or not data.get('data', {}).get('rasp'):
+        schedule_text = f"расписание для {date.strftime('%d.%m.%Y')} не найдено."
+        cache[key] = schedule_text
+        save_cache(cache)
+        return schedule_text
 
     subgroup_text = f"{subgroup} п/г" if subgroup != "all" else "все подгруппы"
     day_of_week = ""
@@ -46,10 +90,8 @@ async def get_schedule(date: datetime.date, subgroup: str) -> str:
                 (subgroup == "all" and "п/г" in lesson['дисциплина']) or
                 (subgroup != "all" and f"п/г {subgroup}" in lesson['дисциплина'])):
                 found = True
-
                 room_raw = str(lesson.get('аудитория', 'Не указана')).strip().capitalize()
                 room = room_raw.split('-', 1)[1] if '-' in room_raw else room_raw
-
                 schedule_text += (
                     f"🕓 {lesson['начало']} - {lesson['конец']}\n"
                     f"📚 {lesson['дисциплина']}\n"
@@ -58,14 +100,16 @@ async def get_schedule(date: datetime.date, subgroup: str) -> str:
                 )
 
     if not found:
-        return f"расписание для {date.strftime('%d.%m.%Y')} ({subgroup_text}) не найдено."
+        schedule_text = f"расписание для {date.strftime('%d.%m.%Y')} ({subgroup_text}) не найдено."
+    else:
+        schedule_text = (
+            f"{day_of_week}\n\n"
+            f"расписание на {date.strftime('%d.%m.%Y')} ({subgroup_text})\n\n"
+            + schedule_text.split('\n', 2)[2]
+        )
 
-    schedule_text = (
-        f"{day_of_week}\n\n"
-        f"расписание на {date.strftime('%d.%m.%Y')} ({subgroup_text})\n\n"
-        + schedule_text.split('\n', 2)[2]
-    )
-
+    cache[key] = schedule_text
+    save_cache(cache)
     return schedule_text
 
 def create_subgroup_keyboard() -> InlineKeyboardMarkup:
@@ -118,25 +162,17 @@ async def start_handler(message: Message, state: FSMContext):
     await state.update_data(start_prompt_id=sent_message.message_id)
     await state.set_state(ScheduleStates.select_subgroup)
 
-@dp.callback_query(
-    lambda c: c.data.startswith("subgroup_"), StateFilter(ScheduleStates.select_subgroup)
-)
+@dp.callback_query(lambda c: c.data.startswith("subgroup_"), StateFilter(ScheduleStates.select_subgroup))
 async def process_subgroup_callback(callback_query: CallbackQuery, state: FSMContext):
     subgroup = callback_query.data.split("_")[1]
     today = datetime.now().date()
     schedule = await get_schedule(today, subgroup)
 
     data = await state.get_data()
-    user_command_id = data.get("user_command_id")
-    start_prompt_id = data.get("start_prompt_id")
-    last_message_id = data.get("last_message_id")
-
-    for msg_id in [user_command_id, start_prompt_id, last_message_id]:
+    for msg_id in [data.get("user_command_id"), data.get("start_prompt_id"), data.get("last_message_id")]:
         if msg_id:
             try:
-                await bot.delete_message(
-                    chat_id=callback_query.message.chat.id, message_id=msg_id
-                )
+                await bot.delete_message(chat_id=callback_query.message.chat.id, message_id=msg_id)
             except Exception:
                 pass
 
@@ -154,9 +190,7 @@ async def process_subgroup_callback(callback_query: CallbackQuery, state: FSMCon
     await state.set_state(ScheduleStates.select_date)
     await callback_query.answer()
 
-@dp.callback_query(
-    lambda c: c.data.startswith(("prev_", "next_")), StateFilter(ScheduleStates.select_date)
-)
+@dp.callback_query(lambda c: c.data.startswith(("prev_", "next_")), StateFilter(ScheduleStates.select_date))
 async def process_day_callback(callback_query: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     subgroup = data.get("subgroup", "all")
@@ -175,7 +209,16 @@ async def process_day_callback(callback_query: CallbackQuery, state: FSMContext)
     )
     await callback_query.answer()
 
+async def background_updater():
+    while True:
+        cache = load_cache()
+        cache = clean_cache(cache)
+        await fetch_schedule_from_api()
+        save_cache(cache)
+        await asyncio.sleep(3600)
+
 async def main():
+    asyncio.create_task(background_updater())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
